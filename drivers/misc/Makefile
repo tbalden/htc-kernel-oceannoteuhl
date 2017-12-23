@@ -77,3 +77,6 @@ obj-$(CONFIG_QPNP_MISC) 	+= qpnp-misc.o
 
 obj-$(CONFIG_HTC_FLASHLIGHT) += htc_flashlight.o
 obj-$(CONFIG_HTC_MCUROUTE) += htc_mcuroute.o
+
+obj-$(CONFIG_UCI)  += uci/
+obj-$(CONFIG_FORCE_FAST_CHARGE)		+= fastcharge/
