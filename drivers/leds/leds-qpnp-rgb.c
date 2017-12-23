@@ -1,5 +1,6 @@
-
 /* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016. Illes Pal Zoltan "tbalden " (illespal@gmail.com) - BLN and RGB nice blink
+ *                     additions. Charge level colored LED addition.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -30,6 +31,12 @@
 #ifdef CONFIG_FB
 #include <linux/notifier.h>
 #include <linux/fb.h>
+#endif
+
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+#include <linux/alarmtimer.h>
+#include <linux/notification/notification.h>
+#include <linux/uci/uci.h>
 #endif
 
 #define LED_TRIGGER_DEFAULT		"none"
@@ -98,6 +105,9 @@
 #define BLUE_LONG_LUT_START		GREEN_LONG_LUT_START + LONG_LUT_LEN
 #define LONG_LUT_LEN			2
 
+#define PULSE_LUT_LEN			7
+
+
 #define MAIN_TOUCH_SOLUTION 2
 #define SEC_TOUCH_SOLUTION 1
 
@@ -107,8 +117,8 @@ static int blue_short_lut [2] = {0};
 static int amber_long_lut [2] = {0};
 static int green_long_lut [2] = {0};
 static int blue_long_lut [2] = {0};
-static int lut_on [] = {0, 0, 10, 30, 45, 60, 75, 90, 100};
-static int lut_off [] = {100, 100, 90, 75, 60, 45, 30, 10, 0};
+//static int lut_on [] = {0, 0, 10, 30, 45, 60, 75, 90, 100};
+//static int lut_off [] = {100, 100, 90, 75, 60, 45, 30, 10, 0};
 static uint16_t g_led_touch_solution = MAIN_TOUCH_SOLUTION;
 static u8 color_table[20] = {0};
 static int use_color_table = 0;
@@ -175,6 +185,17 @@ static u8 mpp_debug_regs[] = {
 	0x40, 0x41, 0x42, 0x45, 0x46, 0x4c,
 };
 
+/**
+ *  pwm_config_data - pwm configuration data
+ *  @lut_params - lut parameters to be used by pwm driver
+ *  @pwm_device - pwm device
+ *  @pwm_period_us - period for pwm, in us
+ *  @mode - mode the led operates in
+ *  @old_duty_pcts - storage for duty pcts that may need to be reused
+ *  @default_mode - default mode of LED as set in device tree
+ *  @use_blink - use blink sysfs entry
+ *  @blinking - device is currently blinking w/LPG mode
+ */
 struct pwm_config_data {
 	struct lut_params	lut_params;
 	struct pwm_device	*pwm_dev;
@@ -190,6 +211,20 @@ struct pwm_config_data {
 	int 	pwm_coefficient;
 };
 
+/**
+ *  mpp_config_data - mpp configuration data
+ *  @pwm_cfg - device pwm configuration
+ *  @current_setting - current setting, 5ma-40ma in 5ma increments
+ *  @source_sel - source selection
+ *  @mode_ctrl - mode control
+ *  @vin_ctrl - input control
+ *  @min_brightness - minimum brightness supported
+ *  @pwm_mode - pwm mode in use
+ *  @max_uV - maximum regulator voltage
+ *  @min_uV - minimum regulator voltage
+ *  @mpp_reg - regulator to power mpp based LED
+ *  @enable - flag indicating LED on or off
+ */
 struct mpp_config_data {
 	struct pwm_config_data	*pwm_cfg;
 	u8	current_setting;
@@ -210,6 +245,21 @@ struct rgb_config_data {
 	u8	enable;
 };
 
+/**
+ * struct qpnp_led_data - internal led data structure
+ * @led_classdev - led class device
+ * @delayed_work - delayed work for turning off the LED
+ * @workqueue - dedicated workqueue to handle concurrency
+ * @work - workqueue for led
+ * @id - led index
+ * @base_reg - base register given in device tree
+ * @lock - to protect the transactions
+ * @reg - cached value of led register
+ * @num_leds - number of leds in the module
+ * @max_current - maximum current supported by LED
+ * @default_on - true: default state max, false, default state 0
+ * @turn_off_delay_ms - number of msec before turning off the LED
+ */
 struct qpnp_led_data {
 	struct led_classdev	cdev;
 	struct spmi_device	*spmi_dev;
@@ -233,7 +283,7 @@ struct qpnp_led_data {
 	int 		base_pwm;
 	uint8_t last_brightness;
 	uint8_t current_setting;
-	
+	/*struct alarm            led_alarm;*/
 	struct work_struct 		led_off_work;
 	int status;
 	int mode;
@@ -249,6 +299,7 @@ static struct workqueue_struct *g_led_on_work_queue;
 static struct qpnp_led_data *g_led_red = NULL, *g_led_green = NULL, *g_led_blue = NULL, *g_led_virtual = NULL;
 
 
+static uint16_t current_off_timer = 0;
 static int current_blink = 0;
 static int table_level_num = 0;
 static DEFINE_MUTEX(flash_lock);
@@ -304,14 +355,664 @@ static void virtual_key_lut_table_set(int *virtual_key_lut_table, int array_len,
 
 	if (target_pwm > last_pwm) {
 		pwm_diff = target_pwm - last_pwm;
-		for(i = 1;i < array_len - 1;i++)
+		for(i = 1;i < array_len - 1;i++) {
 			virtual_key_lut_table[i] = virtual_key_lut_table[0] + (pwm_diff * (100 - base_pwm) / 255) * i / (array_len - 1);
+			LED_INFO("%s, up - index = %d value: %d\n", __func__, i, virtual_key_lut_table[i]);
+		}
 	} else {
 		pwm_diff = last_pwm - target_pwm;
-		for(i = 1;i < array_len - 1;i++)
+		for(i = 1;i < array_len - 1;i++) {
 			virtual_key_lut_table[i] = virtual_key_lut_table[0] - (pwm_diff * (100 - base_pwm) / 255) * i / (array_len - 1);
+			LED_INFO("%s, down - index = %d value: %d\n", __func__, i, virtual_key_lut_table[i]);
+		}
 	}
 }
+
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+static DEFINE_MUTEX(blinkstopworklock);
+static DEFINE_MUTEX(blinkworklock);
+static struct alarm blinkstopfunc_rtc;
+static struct alarm vibrate_rtc;
+static struct alarm double_double_vol_rtc;
+
+// if aosp interface is used for RGB set, this will be set to 1
+static int aosp_mode = 0;
+// wake_by_user: used for AmbientDisplay detection:
+// this if 1, then device is waken by user. Otherwise no Input device was triggered, so we can deduce that it's an AmibentDisplay wake
+// and therefore if this is 0, Flashlight notification can be triggered, and haptic_blinking also can be stored, so that BLN can be
+// triggered later when screen is self BLANKing / screen off....
+static int wake_by_user = 1;
+
+int input_is_wake_by_user(void)
+{
+	pr_info("%s self wake: wake_by_user %d\n",__func__,wake_by_user);
+	return wake_by_user;
+}
+EXPORT_SYMBOL(input_is_wake_by_user);
+
+#define VIRTUAL_RAMP_SETP_TIME_BLINK_SLOW	110
+#define VIRTUAL_RAMP_SETP_TIME_DOUBLE_BLINK_SLOW	90
+
+#define BUTTON_BLINK_SPEED_MAX	9
+#define BUTTON_BLINK_SPEED_DEFAULT	5
+
+#define BUTTON_BLINK_NUMBER_MAX	50
+#define BUTTON_BLINK_NUMBER_DEFAULT	20
+
+static int bln_switch = 1;
+static int bln_speed = BUTTON_BLINK_SPEED_DEFAULT;
+static int bln_number = BUTTON_BLINK_NUMBER_DEFAULT; // infinite = 0
+
+static int screen_on_early = 1;
+static int screen_on = 1;
+static int blinking = 0;
+// haptic_blinking : this is used to follow register_haptic based notif events... when
+// ...AmbientDisplay wakes device (BLN is not possible), but after screen off, BLN is triggered based on this
+// ... in the fb notifier BLANK event part. register_haptic sets it 1, register_input sets it 0 because that will be a user wake...
+// ... also wake_by_user in UNBLANK notification will set it 0:
+static int haptic_blinking = 0; 
+struct qpnp_led_data *buttonled;
+static int charging = 0; // information from OHIO usb driver
+static int charge_level = 0; // information from HTC battery driver
+static int short_vib_notif = 0;
+static int supposedly_charging = 0; // information from led call (multicolor work)
+static int colored_charge_level = 1; // if set to 1, colored charge level handling is enabled, 0 - not
+
+static int lights_down_divider = 1;
+static int pulse_rgb_blink = 1;  // 0 - normal stock blinking / 1 - pulsating
+static int rgb_coeff_divider = 1; // value between 1 - 20
+static int bln_coeff_divider = 2; // value between 1 - 20
+
+static int get_bln_switch(void) {
+	return uci_get_user_property_int_mm("bln", bln_switch, 0, 1);
+}
+static int get_bln_number(void) {
+	return uci_get_user_property_int_mm("bln_number", bln_number, 0, 50);
+}
+static int get_bln_light_level(void) {
+	return uci_get_user_property_int_mm("bln_light_level", bln_coeff_divider-1, 0, 20)+1;
+}
+static int get_bln_speed(void) {
+	return uci_get_user_property_int_mm("bln_speed", bln_speed, 0, 9);
+}
+static int get_bln_rgb_blink_light_level(void) {
+	return uci_get_user_property_int_mm("bln_rgb_light_level", rgb_coeff_divider-1, 0, 20)+1;
+}
+static int get_bln_pulse_rgb_blink(void) {
+	return uci_get_user_property_int_mm("bln_rgb_pulse", pulse_rgb_blink, 0, 1);
+}
+static int get_bln_rgb_batt_colored(void) {
+	return uci_get_user_property_int_mm("bln_rgb_batt_colored", colored_charge_level, 0, 1);
+}
+
+static int qpnp_buttonled_blink_with_alarm(int on,int cancel_alarm);
+static int qpnp_buttonled_blink(int on);
+
+extern void flash_blink(bool haptic);
+extern void flash_stop_blink(void);
+extern void set_suspend_booster(int value);
+extern void set_vibrate(int value);
+
+int input_is_charging(void) {
+	return !!charging;
+}
+EXPORT_SYMBOL(input_is_charging);
+
+// smart automation
+static int smart_get_pulse_dimming(void) {
+	int ret = lights_down_divider;
+	int level = smart_get_notification_level(NOTIF_PULSE_LIGHT);
+	if (level==NOTIF_DIM) {
+		ret = 16; // should DIM!
+	}
+	pr_info("%s smart_notif =========== level: %d  pulse_dimming %d \n",__func__, level, ret);
+	return ret;
+}
+static int smart_get_button_dimming(void) {
+	int ret = lights_down_divider;
+	int level = smart_get_notification_level(NOTIF_BUTTON_LIGHT);
+	if (level==NOTIF_DIM) {
+		ret = 16; // should DIM!
+	}
+	pr_info("%s smart_notif =========== level: %d  buttonlight_dimming %d \n",__func__, level, ret);
+	return ret;
+}
+
+static enum alarmtimer_restart blinkstop_rtc_callback(struct alarm *al, ktime_t now) 
+{
+	LED_INFO("%s step trylock\n",__func__);
+	if (!mutex_trylock(&blinkstopworklock)) {
+		LED_INFO("%s step trylock failed, return \n",__func__);
+		return ALARMTIMER_NORESTART;
+	}
+	LED_INFO("%s step trylock success \n",__func__);
+
+	LED_INFO("%s step unblink? .... blinking %d && !screen_on  %d \n",__func__, blinking, !screen_on);
+	if (blinking && !screen_on) {
+		LED_INFO("%s step unblink! 0\n",__func__);
+		qpnp_buttonled_blink_with_alarm(0,0); // don't let cancel alarm happen, this is the alarm thread!
+	}
+
+	mutex_unlock(&blinkstopworklock);
+
+        return ALARMTIMER_NORESTART;
+}
+
+
+
+static int qpnp_mpp_blink(struct qpnp_led_data *led, int blink_brightness, int cancel_alarm)
+{
+	int rc;
+	u8 val;
+	int virtual_key_lut_table_stop[1] = {0};
+	int virtual_key_lut_table_blink[VIRTUAL_LUT_LEN] = {
+		0/(get_bln_light_level() * smart_get_button_dimming()),10/(get_bln_light_level() * smart_get_button_dimming()),
+		20/(get_bln_light_level() * smart_get_button_dimming()),40/(get_bln_light_level() * smart_get_button_dimming()),
+		50/(get_bln_light_level() * smart_get_button_dimming()),60/(get_bln_light_level() * smart_get_button_dimming()),
+		70/(get_bln_light_level() * smart_get_button_dimming()),80/(get_bln_light_level() * smart_get_button_dimming()),
+		90/(get_bln_light_level() * smart_get_button_dimming()),100/(get_bln_light_level() * smart_get_button_dimming())};
+	int virtual_key_lut_table_double_blink[VIRTUAL_LUT_LEN] = {
+		0/(get_bln_light_level() * smart_get_button_dimming()),10/(get_bln_light_level() * smart_get_button_dimming()),
+		30/(get_bln_light_level() * smart_get_button_dimming()),60/(get_bln_light_level() * smart_get_button_dimming()),
+		80/(get_bln_light_level() * smart_get_button_dimming()),100/(get_bln_light_level() * smart_get_button_dimming()),
+		80/(get_bln_light_level() * smart_get_button_dimming()),50/(get_bln_light_level() * smart_get_button_dimming()),
+		30/(get_bln_light_level() * smart_get_button_dimming()),10/(get_bln_light_level() * smart_get_button_dimming())};
+
+	LED_INFO("%s, name:%s, brightness = %d status: %d\n", __func__, led->cdev.name, blink_brightness, led->status);
+
+	if(virtual_key_led_ignore_flag)
+		return 0;
+
+	if (blink_brightness == led->last_brightness && blink_brightness == 0) {
+		LED_INFO("%s, brightness 0 and no change, return\n", __func__);
+		return 0;
+	}
+
+	// lock started...
+	if (!mutex_trylock(&blinkworklock)) {
+		LED_INFO("%s step trylock failed, return \n",__func__);
+		return 0;
+	}
+
+	if (blink_brightness>0) {
+		if (screen_on) {
+			mutex_unlock(&blinkworklock);
+			return rc;
+		}
+		// lights on...
+		blinking = 1;
+		if (led->mpp_cfg->mpp_reg && !led->mpp_cfg->enable) {
+			rc = regulator_set_voltage(led->mpp_cfg->mpp_reg,
+					led->mpp_cfg->min_uV,
+					led->mpp_cfg->max_uV);
+			if (rc) {
+				dev_err(&led->spmi_dev->dev,
+					"Regulator voltage set failed rc=%d\n",
+									rc);
+				mutex_unlock(&blinkworklock);
+				return rc;
+			}
+
+			rc = regulator_enable(led->mpp_cfg->mpp_reg);
+			if (rc) {
+				dev_err(&led->spmi_dev->dev,
+					"Regulator enable failed(%d)\n", rc);
+				goto err_reg_enable;
+			}
+		}
+
+		led->mpp_cfg->enable = true;
+
+		if (blink_brightness < led->mpp_cfg->min_brightness) {
+			dev_warn(&led->spmi_dev->dev,
+				"brightness is less than supported..." \
+				"set to minimum supported\n");
+			blink_brightness = led->mpp_cfg->min_brightness;
+		}
+
+		if (led->mpp_cfg->pwm_mode != MANUAL_MODE) {
+			if (!led->mpp_cfg->pwm_cfg->blinking) {
+				led->mpp_cfg->pwm_cfg->mode =
+					led->mpp_cfg->pwm_cfg->default_mode;
+				led->mpp_cfg->pwm_mode =
+					led->mpp_cfg->pwm_cfg->default_mode;
+			}
+		}
+
+		if (led->mpp_cfg->pwm_mode == LPG_MODE) {
+
+			int pause_hi = 20;
+			int pause_lo = (8600 - (900 * get_bln_speed())) + 200;
+
+			if (get_bln_number() > 0 && !charging) { // if blink number is not infinite and is not charging, schedule CANCEL work
+				if (!mutex_is_locked(&blinkstopworklock)) {
+					int sleeptime = ( (((short_vib_notif?(VIRTUAL_RAMP_SETP_TIME_DOUBLE_BLINK_SLOW+11):VIRTUAL_RAMP_SETP_TIME_BLINK_SLOW) * (VIRTUAL_LUT_LEN)) * 2) + pause_hi + pause_lo) * get_bln_number();
+
+					ktime_t wakeup_time;
+					ktime_t curr_time = { .tv64 = 0 };
+					wakeup_time = ktime_add_us(curr_time,
+						(sleeptime * 1000LL)); // msec to usec
+					if (cancel_alarm) {
+						alarm_cancel(&blinkstopfunc_rtc); // stop pending alarm...
+						alarm_start_relative(&blinkstopfunc_rtc, wakeup_time); // start new...
+					}
+					LED_INFO("%s: Current Time tv_sec: %ld, Alarm set to tv_sec: %ld\n",
+						__func__,
+						ktime_to_timeval(curr_time).tv_sec,
+						ktime_to_timeval(wakeup_time).tv_sec);
+				}
+			}
+			led->mpp_cfg->pwm_cfg->lut_params.flags = PM_PWM_LUT_LOOP | PM_PWM_LUT_RAMP_UP | PM_PWM_LUT_REVERSE | PM_PWM_LUT_RAMP_UP | PM_PWM_LUT_PAUSE_HI_EN | PM_PWM_LUT_PAUSE_LO_EN;
+			led->mpp_cfg->pwm_cfg->lut_params.start_idx = VIRTUAL_LUT_START;
+			led->mpp_cfg->pwm_cfg->lut_params.idx_len = VIRTUAL_LUT_LEN;
+			led->mpp_cfg->pwm_cfg->lut_params.ramp_step_ms = (short_vib_notif?VIRTUAL_RAMP_SETP_TIME_DOUBLE_BLINK_SLOW:VIRTUAL_RAMP_SETP_TIME_BLINK_SLOW);
+			led->mpp_cfg->pwm_cfg->lut_params.lut_pause_hi = pause_hi;
+			led->mpp_cfg->pwm_cfg->lut_params.lut_pause_lo = pause_lo;
+			led->last_brightness = blink_brightness;
+			rc = pwm_lut_config(led->mpp_cfg->pwm_cfg->pwm_dev,
+					PM_PWM_PERIOD_MIN,
+					// if short vib notif registered, use double blink! e.g. facebook messages, calendars give short vib notifs
+					short_vib_notif?virtual_key_lut_table_double_blink:virtual_key_lut_table_blink,
+					led->mpp_cfg->pwm_cfg->lut_params);
+			short_vib_notif = 0;
+		}
+
+		if (led->mpp_cfg->pwm_mode != MANUAL_MODE)
+			pwm_enable(led->mpp_cfg->pwm_cfg->pwm_dev);
+
+		val = (led->mpp_cfg->source_sel & LED_MPP_SRC_MASK) |
+			(led->mpp_cfg->mode_ctrl & LED_MPP_MODE_CTRL_MASK);
+
+		rc = qpnp_led_masked_write(led,
+			LED_MPP_MODE_CTRL(led->base), LED_MPP_MODE_MASK,
+			val);
+		if (rc) {
+			dev_err(&led->spmi_dev->dev,
+					"Failed to write led mode reg\n");
+			goto err_mpp_reg_write;
+		}
+
+		rc = qpnp_led_masked_write(led,
+				LED_MPP_EN_CTRL(led->base), LED_MPP_EN_MASK,
+				LED_MPP_EN_ENABLE);
+		if (rc) {
+			dev_err(&led->spmi_dev->dev,
+					"Failed to write led enable " \
+					"reg\n");
+			goto err_mpp_reg_write;
+		}
+
+	} else {
+		// lights down
+		pr_info("%s haptic_blinking %d\n", __func__, haptic_blinking);
+		haptic_blinking = 0;
+		blinking = 0;
+		if (cancel_alarm) {
+			alarm_cancel(&blinkstopfunc_rtc);
+		}
+		if (led->mpp_cfg->pwm_mode == LPG_MODE) {
+			led->mpp_cfg->pwm_cfg->lut_params.flags = PM_PWM_LUT_RAMP_UP;
+			led->mpp_cfg->pwm_cfg->lut_params.start_idx = VIRTUAL_LUT_START;
+			led->mpp_cfg->pwm_cfg->lut_params.idx_len = 1;
+			led->mpp_cfg->pwm_cfg->lut_params.ramp_step_ms = VIRTUAL_RAMP_SETP_TIME;
+			led->mpp_cfg->pwm_cfg->lut_params.lut_pause_hi = 0;
+			led->mpp_cfg->pwm_cfg->lut_params.lut_pause_lo = 0;
+			led->last_brightness = blink_brightness;
+			rc = pwm_lut_config(led->mpp_cfg->pwm_cfg->pwm_dev,
+					PM_PWM_PERIOD_MIN,
+					virtual_key_lut_table_stop,
+					led->mpp_cfg->pwm_cfg->lut_params);
+			pwm_enable(led->mpp_cfg->pwm_cfg->pwm_dev);
+			queue_delayed_work(g_led_work_queue, &led->fade_delayed_work,
+				msecs_to_jiffies(led->mpp_cfg->pwm_cfg->lut_params.ramp_step_ms * led->mpp_cfg->pwm_cfg->lut_params.idx_len));
+		}
+	}
+
+	if (led->mpp_cfg->pwm_mode != MANUAL_MODE)
+		led->mpp_cfg->pwm_cfg->blinking = false;
+	qpnp_dump_regs(led, mpp_debug_regs, ARRAY_SIZE(mpp_debug_regs));
+
+	mutex_unlock(&blinkworklock);
+
+	return 0;
+
+err_mpp_reg_write:
+	if (led->mpp_cfg->mpp_reg)
+		regulator_disable(led->mpp_cfg->mpp_reg);
+err_reg_enable:
+	if (led->mpp_cfg->mpp_reg)
+		regulator_set_voltage(led->mpp_cfg->mpp_reg, 0,
+							led->mpp_cfg->max_uV);
+	led->mpp_cfg->enable = false;
+
+	mutex_unlock(&blinkworklock);
+
+	return rc;
+
+
+}
+
+static int qpnp_buttonled_blink_with_alarm(int on, int cancel_alarm)
+{
+	LED_INFO("%s, on = %d cancel_alarm = %d \n", __func__, on, cancel_alarm);
+	return qpnp_mpp_blink(buttonled,on>0?10:0, cancel_alarm);
+}
+
+static int qpnp_buttonled_blink(int on)
+{
+	LED_INFO("%s, on = %d \n", __func__, on);
+	return qpnp_buttonled_blink_with_alarm(on>0?10:0, 1);
+}
+
+// register charging: this symbol function will register charging events from anywhere in kernel calls
+// e.g. from USB ohio driver
+void register_charging(int on)
+{
+	LED_INFO("%s %d\n",__func__,on);
+	charging = on>0?1:0;
+}
+EXPORT_SYMBOL(register_charging);
+
+
+
+// blink pulse for transition work. use it with two leds, one in reverse == 1
+static int led_multicolor_short_transition(struct qpnp_led_data *led, int inverse){
+	int rc = 0;
+	struct lut_params	lut_params;
+	int *lut_short_blink;
+
+	int lut_fade[] = {0, 10 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()) , 30 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 60 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 110 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 170 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 255 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming())};
+	int lut_fade_inv[] = {255 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 170 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 110 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()) , 60 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 30 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 10 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()) , 0};
+
+	if (!charging || !supposedly_charging) return 0;
+
+	LED_INFO("%s, name:%s, brightness = %d status: %d coefficient: %d \n", __func__, led->cdev.name, led->cdev.brightness, led->status, get_bln_rgb_blink_light_level());
+	lut_params.flags = PM_PWM_LUT_LOOP | PM_PWM_LUT_RAMP_UP | PM_PWM_LUT_REVERSE | PM_PWM_LUT_RAMP_UP | PM_PWM_LUT_PAUSE_HI_EN | PM_PWM_LUT_PAUSE_LO_EN;
+	lut_params.start_idx = GREEN_SHORT_LUT_START;
+	lut_params.idx_len = PULSE_LUT_LEN;
+	lut_params.ramp_step_ms = 128;
+	lut_params.lut_pause_lo = 720;
+	lut_params.lut_pause_hi = 10;
+	lut_short_blink = lut_fade;
+	if (inverse)  lut_short_blink = lut_fade_inv;
+	led->rgb_cfg->pwm_cfg->lut_params = lut_params;
+
+	rc = pwm_lut_config(led->rgb_cfg->pwm_cfg->pwm_dev,
+						PM_PWM_PERIOD_MIN,
+						lut_short_blink,
+						led->rgb_cfg->pwm_cfg->lut_params);
+	rc = qpnp_led_masked_write(led,	RGB_LED_EN_CTL(led->base),
+		led->rgb_cfg->enable, led->rgb_cfg->enable);
+	if (rc) {
+		dev_err(&led->spmi_dev->dev,
+			"Failed to write led enable reg\n");
+		return rc;
+	}
+	rc = pwm_enable(led->rgb_cfg->pwm_cfg->pwm_dev);
+
+	mdelay(10);
+	rc = pwm_enable(led->rgb_cfg->pwm_cfg->pwm_dev);
+	led->status = ON;
+	led->rgb_cfg->pwm_cfg->blinking = true;
+	qpnp_dump_regs(led, rgb_pwm_debug_regs, ARRAY_SIZE(rgb_pwm_debug_regs));
+	return rc;
+}
+
+
+static void led_multi_color_charge_level(int level)
+{
+	uint32_t val = 1;
+
+	int level_div = level / 5;
+	int level_round = level_div * 5; // rounding by 5;
+	int us_level = (level_round * 235)/100;
+	int red_coeff = 255 - (us_level); // red be a bit more always, except on FULL charge ( 255 - 220 -> Min = 25, except on full where it is 1 )
+	int green_coeff = 235 - red_coeff; // green be a bit less always, except on FULL charge ( Green max is 220, min 1 - except on full where its 255)
+
+	if (!(get_bln_rgb_batt_colored() && supposedly_charging)) return;
+
+	if (green_coeff < 1) green_coeff = 10;
+
+	if (level<5) { // under 5, always full RED but low light for red
+		red_coeff = 80;
+		green_coeff = 1;
+	} else
+	if (level<15) { // under 15, always full RED but lower light for red
+		red_coeff = 160;
+		green_coeff = 3;
+	} else
+	if (level<20) { // under 20, always full RED full light for red
+		red_coeff = 255;
+		green_coeff = 7;
+	}
+
+	if (level == 100) { // at 100, always full GREEN
+		red_coeff = 1;
+		green_coeff = 255;
+		LED_INFO("%s color transition at full strength: red %d green %d \n",__func__, red_coeff, green_coeff);
+	}
+
+	g_led_red->rgb_cfg->pwm_cfg->pwm_coefficient = red_coeff;
+	g_led_green->rgb_cfg->pwm_cfg->pwm_coefficient = green_coeff;
+	g_led_red->mode = val;
+	g_led_green->mode = val;
+	LED_INFO("%s color mixing charge level: red %d green %d \n",__func__, red_coeff / get_bln_rgb_blink_light_level(), green_coeff / get_bln_rgb_blink_light_level());
+	queue_work(g_led_on_work_queue, &(g_led_red->led_multicolor_work));
+
+	if (level == 100) { // at 100, start fading work too for fancy noticeable look
+		mdelay(100);
+		led_multicolor_short_transition(g_led_red,0);
+	}
+}
+
+static int first_level_registered = 0;
+
+void register_charge_level(int level)
+{
+	LED_INFO("%s %d\n",__func__,level);
+	if (get_bln_rgb_batt_colored() && charging && supposedly_charging) {
+		// TRIGGER COLOR CHANGE of led
+		LED_INFO("%s triggering color change to multicolor led %d\n",__func__,level);
+		led_multi_color_charge_level(level);
+	}
+	charge_level = level;
+	first_level_registered = 1;
+}
+EXPORT_SYMBOL(register_charge_level);
+
+// handling haptic notifications if enabled to register notifications even when RGB led is already blinking, or on charger
+static unsigned long last_haptic_jiffies = 0;
+static unsigned int last_value = 0;
+static unsigned int MAX_DIFF = 200;
+static unsigned int MAX_DIFF_LONG_VIB = 310;
+
+#define FINGERPRINT_VIB_TIME_EXCEPTION 40
+#define FINGERPRINT_VIB_TIME_EXCEPTION_AOSP 30
+#define DOUBLETAP_VIB_TIME_EXCEPTION 25
+
+// callback to register fingerprint vibration
+extern int register_fp_vibration(void);
+
+static unsigned long last_input_event = 0;
+void register_input_event(void) {
+//	pr_info("%s self wake: blocking event - wake_by_user\n",__func__);
+	wake_by_user = 1;
+	last_input_event = jiffies;
+	if (screen_on_early) {
+		// user must have exited Ambient display by pressing power/touchscreen etc, stop flash blinking!
+		flash_stop_blink();
+		// user is inputing phone, no haptic blinking should trigger BLN when screen off
+		haptic_blinking = 0;
+	}
+	smart_set_last_user_activity_time();
+}
+EXPORT_SYMBOL(register_input_event);
+
+static int last_notification_number = 0;
+// register sys uci listener
+void uci_sys_listener(void) {
+      pr_info("%s uci sys parse happened...\n",__func__);
+      {
+            int ringing = uci_get_sys_property_int_mm("ringing", 0, 0, 1);
+            pr_info("%s uci sys ringing %d\n",__func__,ringing);
+            if (ringing) {
+                  register_input_event();
+            }
+      }
+      {
+            int notifications = uci_get_sys_property_int("notifications",0);
+            if (notifications != -EINVAL) {
+            if (notifications>last_notification_number) {
+                        if ( get_bln_switch() && (((!charging && smart_get_button_dimming()==1) || charging)) ) { // do not trigger blink if not on charger and lights down mode
+                                pr_info("%s haptic_blinking %d\n", __func__, haptic_blinking);
+                                // store haptic blinking, so if ambient display blocks the bln, later in BLANK screen off, still it can be triggered
+                                haptic_blinking = 1;
+                                qpnp_buttonled_blink(1);
+                        }
+                        // call flash blink for flashlight notif if lights_down mode (>1) is not active... and not screen on or wake not by user (ambient)
+                        if (lights_down_divider==1 && (!screen_on || !wake_by_user)) {
+                                flash_blink(false);
+                        }
+            }
+            last_notification_number = notifications;
+            }
+        }
+}
+
+
+
+int register_haptic(int value)
+{
+	unsigned int diff_jiffies = jiffies - last_haptic_jiffies;
+	last_haptic_jiffies = jiffies;
+	LED_INFO("%s %d - jiffies diff %u \n",__func__,value, diff_jiffies);
+
+//	if this exceptional time is used, it means, fingerprint scanner vibrated with proxomity sensor detection on
+//	and with unregistered finger, so no wake event. In this case, don't start blinking, not a notif, just return
+	if (value==DOUBLETAP_VIB_TIME_EXCEPTION || value == FINGERPRINT_VIB_TIME_EXCEPTION || value == FINGERPRINT_VIB_TIME_EXCEPTION_AOSP) {
+		int vib_strength = register_fp_vibration();
+		register_input_event(); // to cancel flashing if fingerprint wake which otherwise is not a filtered input even, only vibration...
+		if (vib_strength > 0 && vib_strength<=FINGERPRINT_VIB_TIME_EXCEPTION*2) return vib_strength/2; else return vib_strength>0?FINGERPRINT_VIB_TIME_EXCEPTION:0;
+	}
+
+	if (screen_on && wake_by_user) return value;
+	if (last_value == value) {
+		if ((value > 500 && diff_jiffies < MAX_DIFF_LONG_VIB) || diff_jiffies < MAX_DIFF) {
+			if (value <= 200) {
+				short_vib_notif = 1;
+			} else {
+				short_vib_notif = 0;
+			}
+			if ( get_bln_switch() && (((!charging && smart_get_button_dimming()==1) || charging)) ) { // do not trigger blink if not on charger and lights down mode
+				pr_info("%s haptic_blinking %d\n", __func__, haptic_blinking);
+				// store haptic blinking, so if ambient display blocks the bln, later in BLANK screen off, still it can be triggered
+				haptic_blinking = 1;
+				qpnp_buttonled_blink(1);
+			}
+			// call flash blink for flashlight notif if lights_down mode (>1) is not active...
+			if (lights_down_divider==1) {
+				flash_blink(true);
+			}
+		}
+	}
+	last_value = value;
+	return value;
+}
+
+EXPORT_SYMBOL(register_haptic);
+
+static enum alarmtimer_restart vibrate_rtc_callback(struct alarm *al, ktime_t now)
+{
+	if (lights_down_divider == 1) { 
+		set_vibrate(111);
+	} else {
+		set_vibrate(234);
+	}
+	return ALARMTIMER_NORESTART;
+}
+
+// vib notification reminder
+extern void set_vib_notification_reminder(int value);
+extern int get_vib_notification_reminder(void);
+extern void set_vib_notification_slowness(int value);
+extern int get_vib_notification_slowness(void);
+extern void set_vib_notification_length(int value);
+extern int get_vib_notification_length(void);
+
+static int double_double_vol_check_running = 0;
+static enum alarmtimer_restart double_double_vol_rtc_callback(struct alarm *al, ktime_t now)
+{
+	double_double_vol_check_running = 0;
+	if (lights_down_divider==1 && !get_vib_notification_reminder()) {lights_down_divider = 16; set_vibrate(451);} else {lights_down_divider = 1;set_vibrate(101);}
+	set_vib_notification_reminder(0);
+	return ALARMTIMER_NORESTART;
+}
+
+void register_double_volume_key_press(int long_press) {
+	if (screen_on) return;
+	pr_info("%s gpio -> lights down divider - %d\n",__func__,lights_down_divider);
+	if (long_press) {
+		ktime_t wakeup_time;
+		ktime_t curr_time = { .tv64 = 0 };
+		wakeup_time = ktime_add_us(curr_time,
+			(500 * 1000LL)); // msec to usec
+		// always switch on low light mode, very long vibration signal
+		set_suspend_booster(1); // suspend vibration boosting
+		lights_down_divider = 16; 
+		set_vibrate(231);
+		alarm_cancel(&vibrate_rtc); // stop pending alarm...
+		alarm_start_relative(&vibrate_rtc, wakeup_time); // start new...
+	} else {
+		set_suspend_booster(0);
+		if (!double_double_vol_check_running) {
+			ktime_t wakeup_time;
+			ktime_t curr_time = { .tv64 = 0 };
+			wakeup_time = ktime_add_us(curr_time,
+				(400 * 1000LL)); // msec to usec
+			// start double double check alarm timer... if it is not canceled, then it will switch between low/full light modes...
+			double_double_vol_check_running = 1;
+			alarm_cancel(&double_double_vol_rtc); // stop pending alarm...
+			alarm_start_relative(&double_double_vol_rtc, wakeup_time); // start new...
+		} else {
+			ktime_t wakeup_time;
+			ktime_t curr_time = { .tv64 = 0 };
+			wakeup_time = ktime_add_us(curr_time,
+				(200 * 1000LL)); // msec to usec
+			// double press on time...switch full light mode and vib notification reminder on
+			alarm_cancel(&double_double_vol_rtc); // stop pending alarm...
+			double_double_vol_check_running = 0;
+			set_vib_notification_reminder(1);
+			lights_down_divider = 1;set_vibrate(110);
+			alarm_cancel(&vibrate_rtc); // stop pending alarm...
+			alarm_start_relative(&vibrate_rtc, wakeup_time); // start new...vibrate a second one...
+		}
+	}
+}
+EXPORT_SYMBOL(register_double_volume_key_press);
+
+
+#endif
+#ifndef CONFIG_LEDS_QPNP_BUTTON_BLINK
+void register_charging(int on)
+{
+	LED_INFO("%s %d\n",__func__,on);
+}
+EXPORT_SYMBOL(register_charging);
+
+void register_haptic(int value)
+{
+	LED_INFO("%s %d\n",__func__,value);
+}
+EXPORT_SYMBOL(register_haptic);
+void register_charge_level(int level)
+{
+	LED_INFO("%s %d\n",__func__,level);
+}
+EXPORT_SYMBOL(register_charge_level);
+#endif
+
+// last time qpnp_mpp_set done, which means Virtual keys were set brightnesss, which is a wake not by ambient display, but by user...
+static unsigned long last_vk_wake = 0;
 
 static int qpnp_mpp_set(struct qpnp_led_data *led)
 {
@@ -321,6 +1022,11 @@ static int qpnp_mpp_set(struct qpnp_led_data *led)
 	int virtual_key_lut_table[VIRTUAL_LUT_LEN] = {0};
 
 	LED_INFO("%s, name:%s, brightness = %d status: %d\n", __func__, led->cdev.name, led->cdev.brightness, led->status);
+
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+	blinking = 0;
+	last_vk_wake = jiffies;
+#endif
 
 	if(virtual_key_led_ignore_flag)
 		return 0;
@@ -360,6 +1066,7 @@ static int qpnp_mpp_set(struct qpnp_led_data *led)
 	}
 
 	if (led->cdev.brightness) {
+		// lights on...
 		if (led->mpp_cfg->mpp_reg && !led->mpp_cfg->enable) {
 			rc = regulator_set_voltage(led->mpp_cfg->mpp_reg,
 					led->mpp_cfg->min_uV,
@@ -480,6 +1187,7 @@ static int qpnp_mpp_set(struct qpnp_led_data *led)
 			goto err_mpp_reg_write;
 		}
 	} else {
+		// lights down
 		if (led->mpp_cfg->pwm_mode == LPG_MODE) {
 			led->mpp_cfg->pwm_cfg->lut_params.flags = PM_PWM_LUT_RAMP_UP;
 			led->mpp_cfg->pwm_cfg->lut_params.start_idx = VIRTUAL_LUT_START;
@@ -667,7 +1375,20 @@ static void led_blink_do_work(struct work_struct *work)
 static int qpnp_rgb_set(struct qpnp_led_data *led)
 {
 	int rc;
+	int lut_on_rgb [1] = {255/(get_bln_rgb_blink_light_level() * smart_get_pulse_dimming())};
+	int lut_off_rgb [1] = {0};
 	LED_INFO("%s, name:%s, brightness = %d status: %d\n", __func__, led->cdev.name, led->cdev.brightness, led->status);
+
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+	// if charging this should be ignored, and not switch BLN off,
+	// because stock rom calls amber led rgb_set when charging even 
+	// when the notification was not yet canceled by User on screen.
+	if (!screen_on && blinking && led!=buttonled && !charging) {
+		qpnp_buttonled_blink(0);
+		flash_stop_blink();
+	}
+
+#endif
 
 	if (led->rgb_cfg->pwm_cfg->mode == RGB_MODE_LPG) {
 		cancel_delayed_work(&led->fade_delayed_work);
@@ -675,7 +1396,7 @@ static int qpnp_rgb_set(struct qpnp_led_data *led)
 	if (led->cdev.brightness) {
 		if (led->status != ON) {
 			if (led->rgb_cfg->pwm_cfg->mode == RGB_MODE_PWM) {
-				rc = pwm_config_us(led->rgb_cfg->pwm_cfg->pwm_dev, 640 * led->rgb_cfg->pwm_cfg->pwm_coefficient / 255, 640);
+				rc = pwm_config_us(led->rgb_cfg->pwm_cfg->pwm_dev, 640 * led->rgb_cfg->pwm_cfg->pwm_coefficient / 255 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 640);
 				if (rc < 0) {
 					dev_err(&led->spmi_dev->dev, "Failed to " \
 						"configure pwm for new values\n");
@@ -685,7 +1406,7 @@ static int qpnp_rgb_set(struct qpnp_led_data *led)
 			} else if (led->rgb_cfg->pwm_cfg->mode == RGB_MODE_LPG) {
 							rc = pwm_lut_config(led->rgb_cfg->pwm_cfg->pwm_dev,
 					PM_PWM_PERIOD_MIN,
-									lut_on,
+									lut_on_rgb,
 									led->rgb_cfg->pwm_cfg->lut_params);
 			}
 
@@ -731,7 +1452,7 @@ static int qpnp_rgb_set(struct qpnp_led_data *led)
 			wake_lock_timeout(&pmic_led_rgb_wake_lock[led->id], HZ*2);
                         rc = pwm_lut_config(led->rgb_cfg->pwm_cfg->pwm_dev,
 				PM_PWM_PERIOD_MIN,
-				lut_off,
+				lut_off_rgb,
                                 led->rgb_cfg->pwm_cfg->lut_params);
                         if (rc < 0) {
                                 dev_err(&led->spmi_dev->dev, "Failed to " \
@@ -1341,9 +2062,9 @@ static void mpp_blink(struct qpnp_led_data *led,
 		if (led->id == QPNP_ID_LED_MPP)
 			led->mpp_cfg->pwm_mode = pwm_cfg->default_mode;
 	}
-	
-	
-	
+	/*pwm_free(pwm_cfg->pwm_dev);*/
+	/*qpnp_pwm_init(pwm_cfg, led->spmi_dev, led->cdev.name);*/
+	/*for qcom lut breath blink, not for htc blink*/
 	qpnp_led_set(&led->cdev, led->cdev.brightness);
 }
 
@@ -1362,6 +2083,18 @@ static ssize_t blink_store(struct device *dev,
 	led = container_of(led_cdev, struct qpnp_led_data, cdev);
 	led->cdev.brightness = blinking ? led->cdev.max_brightness : 0;
 
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+	if (get_bln_switch() || blinking==0) {
+		if ( (blinking && smart_get_button_dimming()==1) || !blinking || charging) {
+			qpnp_buttonled_blink(blinking);
+		}
+	}
+	if (!blinking) {
+		flash_stop_blink();
+	} else if (lights_down_divider==1 && (!screen_on || !wake_by_user)) {
+		flash_blink(false);
+	}
+#endif
 	switch (led->id) {
 	case QPNP_ID_LED_MPP:
 			mpp_blink(led, led->mpp_cfg->pwm_cfg);
@@ -1446,7 +2179,7 @@ static int qpnp_rgb_init(struct qpnp_led_data *led)
 			"Failed to initialize pwm\n");
 		return rc;
 	}
-	
+	/* Initialize led for use in auto trickle charging mode */
 	rc = qpnp_led_masked_write(led, RGB_LED_ATC_CTL(led->base),
 		led->rgb_cfg->enable, led->rgb_cfg->enable);
 
@@ -1561,6 +2294,9 @@ static int qpnp_get_common_configs(struct qpnp_led_data *led,
 	return 0;
 }
 
+/*
+ * Handlers for alternative sources of platform_data
+ */
 static int qpnp_get_config_pwm(struct pwm_config_data *pwm_cfg,
 				struct spmi_device *spmi_dev,
 				struct device_node *node)
@@ -1774,7 +2510,7 @@ static int qpnp_get_config_rgb(struct qpnp_led_data *led,
 	rc = qpnp_get_config_pwm(led->rgb_cfg->pwm_cfg, led->spmi_dev, node);
 	if (rc < 0)
 		return rc;
-	
+	/* HTC add*/
 	wake_lock_init(&pmic_led_rgb_wake_lock[led->id], WAKE_LOCK_SUSPEND, "qpnp_led");
 	if (led->rgb_cfg->pwm_cfg->mode == LPG_MODE) {
 		INIT_DELAYED_WORK(&led->fade_delayed_work, led_fade_do_work);
@@ -1786,7 +2522,7 @@ static int qpnp_get_config_rgb(struct qpnp_led_data *led,
 		led->rgb_cfg->pwm_cfg->lut_params.lut_pause_hi = 0;
 		led->rgb_cfg->pwm_cfg->lut_params.lut_pause_lo = 0;
 	}
-	
+	/*        */
 
 	return 0;
 }
@@ -2081,6 +2817,249 @@ void set_led_touch_solution(uint16_t solution)
 EXPORT_SYMBOL(set_led_touch_solution);
 #endif
 
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+// --- vib notification reminder
+static ssize_t vib_notification_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", get_vib_notification_reminder());
+}
+
+static ssize_t vib_notification_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 0 || input > 1)
+            input = 1;
+
+	set_vib_notification_reminder(input);
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_vib_notification, (S_IWUSR|S_IRUGO),
+      vib_notification_show, vib_notification_dump);
+
+
+static ssize_t vib_notification_slowness_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", get_vib_notification_slowness());
+}
+
+static ssize_t vib_notification_slowness_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 5 || input > 30)
+            input = 15;
+
+      set_vib_notification_slowness(input);
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_vib_notification_slowness, (S_IWUSR|S_IRUGO),
+      vib_notification_slowness_show, vib_notification_slowness_dump);
+
+
+static ssize_t vib_notification_length_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", get_vib_notification_length());
+}
+
+static ssize_t vib_notification_length_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 1 || input > 500)
+            input = 300;
+
+	set_vib_notification_length(input);
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_vib_notification_length, (S_IWUSR|S_IRUGO),
+      vib_notification_length_show, vib_notification_length_dump);
+
+
+
+// pulse on/off settings
+static ssize_t bln_pulse_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", pulse_rgb_blink);
+}
+
+static ssize_t bln_pulse_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 0 || input > 1)
+            input = 0;
+
+      pulse_rgb_blink = input;
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_rgb_pulse, (S_IWUSR|S_IRUGO),
+      bln_pulse_show, bln_pulse_dump);
+
+// coeff divider for notification blinking
+static ssize_t bln_coeff_div_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", (get_bln_rgb_blink_light_level()<20?(get_bln_rgb_blink_light_level()-1):20));
+}
+
+static ssize_t bln_coeff_div_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 0 || input > 20)
+            input = 0;
+
+      if (input < 20) {
+	      rgb_coeff_divider = input + 1;
+      } else rgb_coeff_divider = 500;
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_rgb_blink_light_level, (S_IWUSR|S_IRUGO),
+      bln_coeff_div_show, bln_coeff_div_dump);
+
+
+// charge color combo test sysfs
+// =============================
+static ssize_t bln_battery_test_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", charge_level);
+}
+
+static ssize_t bln_battery_test_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 0 || input > 100)
+            input = 0;
+
+	led_multi_color_charge_level(input);
+      return count;
+}
+
+static DEVICE_ATTR(bln_rgb_batt_test, (S_IWUSR|S_IRUGO),
+      bln_battery_test_show, bln_battery_test_dump);
+
+
+// charge color combination on/off
+static ssize_t bln_rgb_colored_battery_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", colored_charge_level);
+}
+
+static ssize_t bln_rgb_colored_battery_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 0 || input > 1)
+            input = 1;
+
+	colored_charge_level = input;
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_rgb_batt_colored, (S_IWUSR|S_IRUGO),
+      bln_rgb_colored_battery_show, bln_rgb_colored_battery_dump);
+
+
+// coeff divider for button blinking
+static ssize_t bln_coeff2_div_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", (bln_coeff_divider-1));
+}
+
+static ssize_t bln_coeff2_div_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 0 || input > 20)
+            input = 0;
+
+      bln_coeff_divider = input + 1;
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_light_level, (S_IWUSR|S_IRUGO),
+      bln_coeff2_div_show, bln_coeff2_div_dump);
+
+
+#endif
+
+static struct lut_params multicolor_lut_params = {
+	.flags = QPNP_LED_PWM_FLAGS | PM_PWM_LUT_PAUSE_HI_EN,
+	.idx_len = SHORT_LUT_LEN,
+	.ramp_step_ms = 64,
+	.lut_pause_hi = 1792,
+	.lut_pause_lo = 0,
+};
+
 static int led_multicolor_short_blink(struct qpnp_led_data *led, int pwm_coefficient){
 	int rc = 0;
 	struct lut_params	lut_params;
@@ -2090,7 +3069,7 @@ static int led_multicolor_short_blink(struct qpnp_led_data *led, int pwm_coeffic
 	lut_params.flags = QPNP_LED_PWM_FLAGS | PM_PWM_LUT_PAUSE_HI_EN;
 	lut_params.idx_len = SHORT_LUT_LEN;
 	lut_params.ramp_step_ms = 64;
-	lut_params.lut_pause_hi = 1792; 
+	lut_params.lut_pause_hi = 1792; // Pause time = (1792 / 64 + 1) * 64 = 1856
 	lut_params.lut_pause_lo = 0;
 
 	switch(led->id){
@@ -2108,6 +3087,39 @@ static int led_multicolor_short_blink(struct qpnp_led_data *led, int pwm_coeffic
 			break;
 	}
 	lut_short_blink[0] = pwm_coefficient;
+
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+	if (get_bln_pulse_rgb_blink() == 0) {
+		lut_short_blink[0] = lut_short_blink[0] / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming());
+	}
+	if (led->id == QPNP_ID_RGB_GREEN && get_bln_pulse_rgb_blink() == 1) {
+		int lut_fade [] = {0, 0, 10 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 60 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 110 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 170 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 255 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming())};
+		LED_INFO("%s, name:%s, brightness = %d status: %d coefficient: %d \n", __func__, led->cdev.name, led->cdev.brightness, led->status, pwm_coefficient);
+
+		lut_params.flags = PM_PWM_LUT_LOOP | PM_PWM_LUT_RAMP_UP | PM_PWM_LUT_REVERSE | PM_PWM_LUT_PAUSE_HI_EN | PM_PWM_LUT_PAUSE_LO_EN;
+		lut_params.start_idx = GREEN_SHORT_LUT_START;
+		lut_params.idx_len = PULSE_LUT_LEN;
+		lut_params.ramp_step_ms = 64;
+		lut_params.lut_pause_hi = 0;
+		lut_params.lut_pause_lo = 1500;
+
+		lut_short_blink = lut_fade;
+	}
+	if (led->id == QPNP_ID_RGB_RED && get_bln_pulse_rgb_blink() == 1) {
+		int lut_fade [] = {0, 0, 10 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 60 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 110 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 170 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 255 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming())};
+		LED_INFO("%s, name:%s, brightness = %d status: %d coefficient: %d \n", __func__, led->cdev.name, led->cdev.brightness, led->status, pwm_coefficient);
+
+		lut_params.flags = PM_PWM_LUT_LOOP | PM_PWM_LUT_RAMP_UP | PM_PWM_LUT_REVERSE | PM_PWM_LUT_PAUSE_HI_EN | PM_PWM_LUT_PAUSE_LO_EN;
+		lut_params.start_idx = AMBER_SHORT_LUT_START;
+		lut_params.idx_len = PULSE_LUT_LEN;
+		lut_params.ramp_step_ms = 64;
+		lut_params.lut_pause_hi = 0;
+		lut_params.lut_pause_lo = 1500;
+
+		lut_short_blink = lut_fade;
+	}
+#endif
+
 	led->rgb_cfg->pwm_cfg->lut_params = lut_params;
 
 	rc = pwm_lut_config(led->rgb_cfg->pwm_cfg->pwm_dev,
@@ -2122,11 +3134,20 @@ static int led_multicolor_short_blink(struct qpnp_led_data *led, int pwm_coeffic
 		return rc;
 	}
 	rc = pwm_enable(led->rgb_cfg->pwm_cfg->pwm_dev);
-	
+	/* turn on indicator workaround, QCOM HW bug*/
 	mdelay(10);
 	rc = pwm_enable(led->rgb_cfg->pwm_cfg->pwm_dev);
 	led->status = ON;
 	led->rgb_cfg->pwm_cfg->blinking = true;
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+	if ( get_bln_switch() && (((!charging && smart_get_button_dimming()==1) || charging)) ) { // do not trigger blink if not on charger and lights down mode
+		qpnp_buttonled_blink(1);
+	}
+	// call flash blink for flashlight notif if lights_down mode (>1) is not active...
+	if (lights_down_divider==1 && (!screen_on || !wake_by_user)) {
+		flash_blink(false);
+	}
+#endif
 	qpnp_dump_regs(led, rgb_pwm_debug_regs, ARRAY_SIZE(rgb_pwm_debug_regs));
 	return rc;
 }
@@ -2158,6 +3179,39 @@ static int led_multicolor_long_blink(struct qpnp_led_data *led, int pwm_coeffici
 			break;
 	}
 	lut_long_blink[0] = pwm_coefficient;
+
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+	if (get_bln_pulse_rgb_blink() == 0) {
+		lut_long_blink[0] = lut_long_blink[0] / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming());
+	}
+	if (led->id == QPNP_ID_RGB_GREEN && get_bln_pulse_rgb_blink() == 1) {
+		int lut_fade [] = {0, 0, 10 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 60 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 110 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 170 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 255 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming())};
+		LED_INFO("%s, name:%s, brightness = %d status: %d coefficient: %d \n", __func__, led->cdev.name, led->cdev.brightness, led->status, pwm_coefficient);
+
+		lut_params.flags = PM_PWM_LUT_LOOP | PM_PWM_LUT_RAMP_UP | PM_PWM_LUT_REVERSE | PM_PWM_LUT_PAUSE_HI_EN | PM_PWM_LUT_PAUSE_LO_EN;
+		lut_params.start_idx = GREEN_SHORT_LUT_START;
+		lut_params.idx_len = PULSE_LUT_LEN;
+		lut_params.ramp_step_ms = 64;
+		lut_params.lut_pause_hi = 0;
+		lut_params.lut_pause_lo = 2500;
+
+		lut_long_blink = lut_fade;
+	}
+	if (led->id == QPNP_ID_RGB_RED && get_bln_pulse_rgb_blink() == 1) {
+		int lut_fade [] = {0, 0, 10 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 60 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 110 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 170 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming()), 255 / (get_bln_rgb_blink_light_level() * smart_get_pulse_dimming())};
+		LED_INFO("%s, name:%s, brightness = %d status: %d coefficient: %d \n", __func__, led->cdev.name, led->cdev.brightness, led->status, pwm_coefficient);
+
+		lut_params.flags = PM_PWM_LUT_LOOP | PM_PWM_LUT_RAMP_UP | PM_PWM_LUT_REVERSE | PM_PWM_LUT_PAUSE_HI_EN | PM_PWM_LUT_PAUSE_LO_EN;
+		lut_params.start_idx = AMBER_SHORT_LUT_START;
+		lut_params.idx_len = PULSE_LUT_LEN;
+		lut_params.ramp_step_ms = 64;
+		lut_params.lut_pause_hi = 0;
+		lut_params.lut_pause_lo = 2500;
+
+		lut_long_blink = lut_fade;
+	}
+#endif
+
 	led->rgb_cfg->pwm_cfg->lut_params = lut_params;
 
 	rc = pwm_lut_config(led->rgb_cfg->pwm_cfg->pwm_dev,
@@ -2172,11 +3226,20 @@ static int led_multicolor_long_blink(struct qpnp_led_data *led, int pwm_coeffici
 		return rc;
 	}
 	rc = pwm_enable(led->rgb_cfg->pwm_cfg->pwm_dev);
-	
+	/* turn on indicator workaround, QCOM HW bug*/
 	mdelay(10);
 	rc = pwm_enable(led->rgb_cfg->pwm_cfg->pwm_dev);
 	led->status = ON;
 	led->rgb_cfg->pwm_cfg->blinking = true;
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+	if ( get_bln_switch() && (((!charging && smart_get_button_dimming()==1) || charging)) ) { // do not trigger blink if not on charger and lights down mode
+		qpnp_buttonled_blink(1);
+	}
+	// call flash blink for flashlight notif if lights_down mode (>1) is not active...
+	if (lights_down_divider==1 && (!screen_on || !wake_by_user)) {
+		flash_blink(false);
+	}
+#endif
 	qpnp_dump_regs(led, rgb_pwm_debug_regs, ARRAY_SIZE(rgb_pwm_debug_regs));
 	return rc;
 }
@@ -2224,7 +3287,7 @@ static int lpg_blink(struct led_classdev *led_cdev, int val)
 					return rc;
 				}
 				rc = pwm_enable(led->rgb_cfg->pwm_cfg->pwm_dev);
-				
+				/* turn on indicator workaround, QCOM HW bug*/
 				mdelay(10);
 				rc = pwm_enable(led->rgb_cfg->pwm_cfg->pwm_dev);
 				led->status = ON;
@@ -2261,7 +3324,7 @@ static int lpg_blink(struct led_classdev *led_cdev, int val)
 			return rc;
 		}
 		rc = pwm_enable(led->rgb_cfg->pwm_cfg->pwm_dev);
-		
+		/* turn on indicator workaround, QCOM HW bug*/
 		mdelay(10);
 		rc = pwm_enable(led->rgb_cfg->pwm_cfg->pwm_dev);
 		led->status = BLINK;
@@ -2301,7 +3364,7 @@ static int lpg_blink(struct led_classdev *led_cdev, int val)
 				return rc;
 		}
 		rc = pwm_enable(led->rgb_cfg->pwm_cfg->pwm_dev);
-		
+		/* turn on indicator workaround, QCOM HW bug*/
 		mdelay(10);
 		rc = pwm_enable(led->rgb_cfg->pwm_cfg->pwm_dev);
 		led->status = BLINK;
@@ -2487,6 +3550,23 @@ void virtual_key_led_reset_blink(int onoff)
 
 EXPORT_SYMBOL(virtual_key_led_reset_blink);
 
+/*
+static void led_alarm_handler(struct alarm *alarm)
+{
+	struct qpnp_led_data *ldata;
+
+	ldata = container_of(alarm, struct qpnp_led_data, led_alarm);
+	queue_work(g_led_work_queue, &ldata->led_off_work);
+}*/
+
+static ssize_t led_off_timer_show(struct device *dev,
+                                    struct device_attribute *attr,
+                                    char *buf)
+{
+	int min = current_off_timer / 60;
+	int sec = current_off_timer - (min * 60);
+	return sprintf(buf, "%d %d\n", min, sec);
+}
 
 static ssize_t led_off_timer_store(struct device *dev,
 				   struct device_attribute *attr,
@@ -2496,6 +3576,8 @@ static ssize_t led_off_timer_store(struct device *dev,
 	struct led_classdev *led_cdev;
 	int min, sec;
 	uint16_t off_timer;
+/*	ktime_t interval;
+	ktime_t next_alarm;*/
 
 	min = -1;
 	sec = -1;
@@ -2511,10 +3593,521 @@ static ssize_t led_off_timer_store(struct device *dev,
 
 	LED_DBG("Setting %s off_timer to %d min %d sec \n", led_cdev->name, min, sec);
 	off_timer = min * 60 + sec;
+	current_off_timer = off_timer;
 
+/*	alarm_cancel(&led->led_alarm);
+	cancel_work_sync(&led->led_off_work);
+	if (off_timer) {
+		interval = ktime_set(off_timer, 0);
+		next_alarm = ktime_add(alarm_get_elapsed_realtime(), interval);
+		alarm_start_range(&led->led_alarm, next_alarm, next_alarm);
+	}*/
 	return count;
 }
-static DEVICE_ATTR(off_timer, 0200, NULL, led_off_timer_store);
+static DEVICE_ATTR(off_timer, 0644, led_off_timer_show, led_off_timer_store);
+
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+
+// flash blink settings
+extern void set_flash_blink_on(int value);
+extern int get_flash_blink_on(void);
+extern void set_flash_blink_number(int value);
+extern int get_flash_blink_number(void);
+
+extern void set_flash_blink_bright(int value);
+extern int get_flash_blink_bright(void);
+extern void set_flash_blink_bright_number(int value);
+extern int get_flash_blink_bright_number(void);
+
+extern void set_flash_blink_wait_sec(int value);
+extern int get_flash_blink_wait_sec(void);
+
+extern void set_flash_blink_wait_inc(int value);
+extern int get_flash_blink_wait_inc(void);
+extern void set_flash_blink_wait_inc_max(int value);
+extern int get_flash_blink_wait_inc_max(void);
+
+extern void set_flash_haptic_mode(int value);
+extern int get_flash_haptic_mode(void);
+extern void set_flash_dim_mode(int value);
+extern int get_flash_dim_mode(void);
+extern void set_flash_dim_use_period(int value);
+extern int get_flash_dim_use_period(void);
+extern void set_flash_dim_period_hours(int startHour, int endHour);
+extern int get_flash_dim_period_hours(int *startEndHours);
+
+
+static ssize_t flash_dim_period_end_hour_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+	int r[2];
+	get_flash_dim_period_hours(&r[0]);
+      return snprintf(buf, PAGE_SIZE, "%d\n", r[1]);
+}
+
+static ssize_t flash_dim_period_end_hour_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+	int r[2];
+	get_flash_dim_period_hours(&r[0]);
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input <= 0 || input > 23)
+            input = 6;
+	r[1] = input;
+	set_flash_dim_period_hours(r[0],r[1]);
+
+      return count;
+}
+static DEVICE_ATTR(bln_flash_dim_period_end_hour, (S_IWUSR|S_IRUGO),
+      flash_dim_period_end_hour_show, flash_dim_period_end_hour_dump);
+
+
+
+static ssize_t flash_dim_period_start_hour_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+	int r[2];
+	get_flash_dim_period_hours(&r[0]);
+      return snprintf(buf, PAGE_SIZE, "%d\n", r[0]);
+}
+
+static ssize_t flash_dim_period_start_hour_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+	int r[2];
+	get_flash_dim_period_hours(&r[0]);
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input <= 0 || input > 23)
+            input = 22;
+	r[0] = input;
+	set_flash_dim_period_hours(r[0],r[1]);
+
+      return count;
+}
+static DEVICE_ATTR(bln_flash_dim_period_start_hour, (S_IWUSR|S_IRUGO),
+      flash_dim_period_start_hour_show, flash_dim_period_start_hour_dump);
+
+
+static ssize_t flash_dim_use_period_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", get_flash_dim_use_period());
+}
+
+static ssize_t flash_dim_use_period_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 0 || input > 1)
+            input = 1; // 0 - use, 1 - not use period
+
+	set_flash_dim_use_period(input);
+
+      return count;
+}
+static DEVICE_ATTR(bln_flash_dim_use_period, (S_IWUSR|S_IRUGO),
+      flash_dim_use_period_show, flash_dim_use_period_dump);
+
+
+static ssize_t flash_dim_mode_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", get_flash_dim_mode());
+}
+
+static ssize_t flash_dim_mode_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 0 || input > 2)
+            input = 1; // 0 no dim mode, 1 half the brightness, 2 fully blanked dim
+
+	set_flash_dim_mode(input);
+
+      return count;
+}
+static DEVICE_ATTR(bln_flash_dim_mode, (S_IWUSR|S_IRUGO),
+      flash_dim_mode_show, flash_dim_mode_dump);
+
+
+static ssize_t flash_haptic_mode_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", get_flash_haptic_mode());
+}
+
+static ssize_t flash_haptic_mode_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 0 || input > 1)
+            input = 1;
+
+	set_flash_haptic_mode(input);
+
+      return count;
+}
+static DEVICE_ATTR(bln_flash_haptic_mode, (S_IWUSR|S_IRUGO),
+      flash_haptic_mode_show, flash_haptic_mode_dump);
+
+
+static ssize_t flash_blink_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", get_flash_blink_on());
+}
+
+static ssize_t flash_blink_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 0 || input > 1)
+            input = 1;
+
+	set_flash_blink_on(input);
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_flash_blink, (S_IWUSR|S_IRUGO),
+      flash_blink_show, flash_blink_dump);
+
+static ssize_t flash_blink_bright_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", get_flash_blink_bright());
+}
+
+static ssize_t flash_blink_bright_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 0 || input > 1)
+            input = 1;
+
+	set_flash_blink_bright(input);
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_flash_blink_bright, (S_IWUSR|S_IRUGO),
+      flash_blink_bright_show, flash_blink_bright_dump);
+
+
+static ssize_t flash_blink_number_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", get_flash_blink_number());
+}
+
+static ssize_t flash_blink_number_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 0 || input > BUTTON_BLINK_NUMBER_MAX)
+            input = BUTTON_BLINK_NUMBER_DEFAULT;
+
+      set_flash_blink_number(input);
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_flash_blink_number, (S_IWUSR|S_IRUGO),
+      flash_blink_number_show, flash_blink_number_dump);
+
+static ssize_t flash_blink_bright_number_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", get_flash_blink_bright_number());
+}
+
+static ssize_t flash_blink_bright_number_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 1 || input > 10)
+            input = 5;
+
+      set_flash_blink_bright_number(input);
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_flash_blink_bright_number, (S_IWUSR|S_IRUGO),
+      flash_blink_bright_number_show, flash_blink_bright_number_dump);
+
+
+static ssize_t flash_blink_wait_inc_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", get_flash_blink_wait_inc());
+}
+
+static ssize_t flash_blink_wait_inc_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 0 || input > 1)
+            input = 1;
+
+	set_flash_blink_wait_inc(input);
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_flash_blink_wait_inc, (S_IWUSR|S_IRUGO),
+      flash_blink_wait_inc_show, flash_blink_wait_inc_dump);
+
+
+static ssize_t flash_blink_wait_inc_max_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", get_flash_blink_wait_inc_max());
+}
+
+static ssize_t flash_blink_wait_inc_max_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 1 || input > 8)
+            input = 4;
+
+      set_flash_blink_wait_inc_max(input);
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_flash_blink_wait_inc_max, (S_IWUSR|S_IRUGO),
+      flash_blink_wait_inc_max_show, flash_blink_wait_inc_max_dump);
+
+static ssize_t flash_blink_wait_sec_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", get_flash_blink_wait_sec());
+}
+
+static ssize_t flash_blink_wait_sec_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 1 || input > 10)
+            input = 2;
+
+      set_flash_blink_wait_sec(input);
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_flash_blink_wait_sec, (S_IWUSR|S_IRUGO),
+      flash_blink_wait_sec_show, flash_blink_wait_sec_dump);
+
+
+
+static ssize_t bln_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", bln_switch);
+}
+
+static ssize_t bln_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 0 || input > 1)
+            input = 0;
+
+      bln_switch = input;
+
+      return count;
+}
+
+static DEVICE_ATTR(bln, (S_IWUSR|S_IRUGO),
+      bln_show, bln_dump);
+
+
+static ssize_t bln_speed_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", bln_speed);
+}
+
+static ssize_t bln_speed_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 0 || input > BUTTON_BLINK_SPEED_MAX)
+            input = BUTTON_BLINK_SPEED_DEFAULT;
+
+      bln_speed = input;
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_speed, (S_IWUSR|S_IRUGO),
+      bln_speed_show, bln_speed_dump);
+
+static ssize_t bln_speed_max_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", BUTTON_BLINK_SPEED_MAX);
+}
+
+static ssize_t bln_speed_max_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 0 || input > BUTTON_BLINK_SPEED_MAX)
+            input = 8;
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_speed_max, (S_IWUSR|S_IRUGO),
+      bln_speed_max_show, bln_speed_max_dump);
+
+
+static ssize_t bln_number_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", bln_number);
+}
+
+static ssize_t bln_number_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      if (input < 0 || input > BUTTON_BLINK_NUMBER_MAX)
+            input = BUTTON_BLINK_NUMBER_DEFAULT;
+
+      bln_number = input;
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_number, (S_IWUSR|S_IRUGO),
+      bln_number_show, bln_number_dump);
+
+
+static ssize_t bln_number_max_show(struct device *dev,
+            struct device_attribute *attr, char *buf)
+{
+      return snprintf(buf, PAGE_SIZE, "%d\n", BUTTON_BLINK_NUMBER_MAX);
+}
+
+static ssize_t bln_number_max_dump(struct device *dev,
+            struct device_attribute *attr, const char *buf, size_t count)
+{
+      int ret;
+      unsigned long input;
+
+      ret = kstrtoul(buf, 0, &input);
+      if (ret < 0)
+            return ret;
+
+      return count;
+}
+
+static DEVICE_ATTR(bln_number_max, (S_IWUSR|S_IRUGO),
+      bln_number_max_show, bln_number_max_dump);
+
+
+#endif
 
 
 static ssize_t pm8xxx_led_blink_show(struct device *dev,
@@ -2543,6 +4136,16 @@ static ssize_t pm8xxx_led_blink_store(struct device *dev,
 	led->mode = val;
 	current_blink = val;
 	LED_INFO("%s: blink: %d\n", __func__, val);
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+	if (val==0 || (bln_switch && (charging || (!charging && smart_get_button_dimming()==1)))) {
+		qpnp_buttonled_blink(val);
+	}
+	if (val==0) {
+		flash_stop_blink();
+	} else if (lights_down_divider==1 && (!screen_on || !wake_by_user)) {
+		flash_blink(false);
+	}
+#endif
 	switch(led->id) {
 		case QPNP_ID_LED_MPP:
 			led->mpp_cfg->blink_mode = val;
@@ -2585,6 +4188,32 @@ static ssize_t led_multi_color_show(struct device *dev,
 	return sprintf(buf, "%x\n", ModeRGB);
 }
 
+static int update_ModeRGB(struct qpnp_led_data *led, uint32_t val)
+{
+	led->mode = (val & Mode_Mask) >> 24;
+	if(g_led_red)
+		g_led_red->rgb_cfg->pwm_cfg->pwm_coefficient= ((val & Red_Mask) >> 16) * indicator_pwm_ratio / 255;
+	if(g_led_green)
+		g_led_green->rgb_cfg->pwm_cfg->pwm_coefficient = ((val & Green_Mask) >> 8) * indicator_pwm_ratio / 255;
+	if(g_led_blue)
+		g_led_blue->rgb_cfg->pwm_cfg->pwm_coefficient = (val & Blue_Mask) * indicator_pwm_ratio / 255;
+	ModeRGB = val;
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+	// we suppose charging if it's coloring led in CONSTANT light and RED (mode val = 1 and only red or only full green (100%) is enabled)
+	supposedly_charging = led->mode == 1 && (g_led_red->rgb_cfg->pwm_cfg->pwm_coefficient > 0 || g_led_green->rgb_cfg->pwm_cfg->pwm_coefficient > 0);
+
+	LED_INFO(" %s , RED = %d supposedly charging %d charging %d\n" , __func__, g_led_red->rgb_cfg->pwm_cfg->pwm_coefficient, supposedly_charging, charging);
+
+	if (get_bln_rgb_batt_colored() && supposedly_charging && first_level_registered) {
+		// if it's supposedly charging and first level registered from HTC battery, we can go and set charge level color mix instead of normal multicolor setting later...
+		led_multi_color_charge_level(charge_level);
+		// and return so color is not overwritten...
+		return 1;
+	}
+#endif
+	return 0;
+}
+
 static ssize_t led_multi_color_store(struct device *dev,
 		struct device_attribute *attr,
 		const char *buf, size_t count)
@@ -2607,12 +4236,58 @@ static ssize_t led_multi_color_store(struct device *dev,
 		g_led_blue->rgb_cfg->pwm_cfg->pwm_coefficient = (val & Blue_Mask) * indicator_pwm_ratio / 255;
 	ModeRGB = val;
 	LED_INFO(" %s , ModeRGB = %x\n" , __func__, val);
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+	// we suppose charging if it's coloring led in CONSTANT light and RED (mode val = 1 and only red or only full green (100%) is enabled)
+	supposedly_charging = led->mode == 1 && (g_led_red->rgb_cfg->pwm_cfg->pwm_coefficient > 0 || g_led_green->rgb_cfg->pwm_cfg->pwm_coefficient > 0);
+
+	LED_INFO(" %s , RED = %d supposedly charging %d charging %d\n" , __func__, g_led_red->rgb_cfg->pwm_cfg->pwm_coefficient, supposedly_charging, charging);
+
+	if (get_bln_rgb_batt_colored() && supposedly_charging && first_level_registered) {
+		// if it's supposedly charging and first level registered from HTC battery, we can go and set charge level color mix instead of normal multicolor setting later...
+		led_multi_color_charge_level(charge_level);
+		// and return so color is not overwritten...
+		return count;
+	}
+#endif
 	queue_work(g_led_on_work_queue, &led->led_multicolor_work);
 	return count;
 }
 
 static DEVICE_ATTR(ModeRGB, 0644, led_multi_color_show,
 		led_multi_color_store);
+
+static ssize_t led_multi_color_mode_and_lut_params_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%x %d %d %d\n", ModeRGB, multicolor_lut_params.ramp_step_ms, multicolor_lut_params.lut_pause_hi, multicolor_lut_params.lut_pause_lo);
+}
+
+static ssize_t led_multi_color_mode_and_lut_params_store(struct device *dev,
+		struct device_attribute *attr,
+		const char *buf, size_t count)
+{
+	struct led_classdev *led_cdev = (struct led_classdev *) dev_get_drvdata(dev);
+	struct qpnp_led_data *led = container_of(led_cdev, struct qpnp_led_data, cdev);
+	uint32_t new_ModeRGB;
+	uint32_t ramp_step_ms, lut_pause_hi, lut_pause_lo;
+
+	if (sscanf(buf, "%x %u %u %u", &new_ModeRGB, &ramp_step_ms, &lut_pause_hi, &lut_pause_lo) != 4) {
+		return -EINVAL;
+	}
+	aosp_mode = 1;
+
+	if (update_ModeRGB(led, new_ModeRGB)) return count;
+	multicolor_lut_params.ramp_step_ms = ramp_step_ms;
+	multicolor_lut_params.lut_pause_hi = lut_pause_hi;
+	multicolor_lut_params.lut_pause_lo = lut_pause_lo;
+
+	queue_work(g_led_on_work_queue, &led->led_multicolor_work);
+
+	return count;
+}
+
+static DEVICE_ATTR(mode_and_lut_params, 0644, led_multi_color_mode_and_lut_params_show,
+		led_multi_color_mode_and_lut_params_store);
 
 static ssize_t led_mpp_current_store(struct device *dev,
 		struct device_attribute *attr,
@@ -2634,6 +4309,11 @@ static ssize_t led_mpp_current_store(struct device *dev,
 	else if (val > LED_MPP_CURRENT_MAX)
 		val = LED_MPP_CURRENT_MAX;
 	else {
+		/*
+		 * PMIC supports LED intensity from 5mA - 40mA
+		 * in steps of 5mA. Brightness is rounded to
+		 * 5mA or nearest lower supported values
+		 */
 		val /= LED_MPP_CURRENT_MIN;
 		val *= LED_MPP_CURRENT_MIN;
 	}
@@ -2818,15 +4498,15 @@ int check_power_source(void)
 	}
 	LED_INFO(" %s, pid = %d, pcb_id = %d\n", __func__, pid, pcb_id);
 	switch(pid) {
-		case 402:	
-		case 405:	
+		case 402:	//PME_UL
+		case 405:	//PME_WL
 			if(pcb_id < 2)
 				return 0xa000;
 			else
 				return 0xa300;
 			break;
-		case 403:	
-		case 406:	
+		case 403:	//PME_UHL
+		case 406:	//PME_WHL
 			if(pcb_id < 1)
 				return 0xa000;
 			else
@@ -2838,19 +4518,58 @@ int check_power_source(void)
 }
 #endif
 
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+static int first_wake = 1;
+#endif
+
 #ifdef CONFIG_FB
 static int fb_notifier_callback(struct notifier_block *self,
                                  unsigned long event, void *data)
 {
     struct fb_event *evdata = data;
     int *blank;
-
+    unsigned int last_vk_wake_diff = jiffies - last_vk_wake;
+    unsigned int last_input_event_diff = jiffies - last_input_event;
     LED_DBG("%s\n", __func__);
+
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+    if (evdata && evdata->data && event == FB_EARLY_EVENT_BLANK && g_led_virtual) {
+        blank = evdata->data;
+        switch (*blank) {
+        case FB_BLANK_UNBLANK:
+		pr_info("%s self wake: wake event EARLY\n",__func__);
+		// if last virtualkey wake was very close, it means that it the user powered screen on.
+		// if it's ambient display, virtual key lights are not set very close to the fb blank events...
+		///// ...also do not care about this if it's not aosp mode
+		wake_by_user = 0;
+		pr_info("%s fb wake_by_user %d diff %u\n",__func__, wake_by_user, last_vk_wake_diff);
+		screen_on_early = 1;
+		if (blinking) {
+			qpnp_buttonled_blink(0);
+		}
+		break;
+	}
+    }
+#endif
+
     if (evdata && evdata->data && event == FB_EVENT_BLANK && g_led_virtual) {
         blank = evdata->data;
         switch (*blank) {
         case FB_BLANK_UNBLANK:
-			
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+		screen_on = 1;
+		// check if first wake or other user input directly before this notifier callback, like doubletap wake...
+		wake_by_user = first_wake || last_input_event_diff < 140; // || !aosp_mode;
+		first_wake = 0; // boot up wake over...
+		pr_info("%s self wake: wake event FULL: wake by user result %d diff %u \n",__func__, wake_by_user, last_input_event_diff);
+		LED_ERR("%s on\n", __func__);
+		if (wake_by_user) {
+			flash_stop_blink();
+			alarm_cancel(&blinkstopfunc_rtc);
+			// user is inputing/waking phone, no haptic blinking should trigger BLN when screen off
+			haptic_blinking = 0;
+		}
+#endif
             break;
 
         case FB_BLANK_POWERDOWN:
@@ -2858,6 +4577,15 @@ static int fb_notifier_callback(struct notifier_block *self,
         case FB_BLANK_VSYNC_SUSPEND:
         case FB_BLANK_NORMAL:
             
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+		screen_on = 0;
+		screen_on_early = 0;
+		LED_ERR("%s off\n", __func__);
+	    if (haptic_blinking) {
+		qpnp_buttonled_blink(1);
+	    } 
+	    else
+#endif
             if(g_led_virtual->cdev.brightness) {
 				g_led_virtual->cdev.brightness = 0;
                 qpnp_mpp_set(g_led_virtual);
@@ -2936,6 +4664,9 @@ static int qpnp_leds_probe(struct spmi_device *spmi)
 				LED_INFO("button-backlight not use power source 0x%04x\n", led->base);
 				goto fail_id_check;
 			}
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+			buttonled = led;
+#endif
 		}
 #endif
 		if(strcmp(led->cdev.name, "indicator") == 0){
@@ -3019,6 +4750,11 @@ static int qpnp_leds_probe(struct spmi_device *spmi)
 				(temp, "qcom,in-order-command-processing");
 
 		if (led->in_order_command_processing) {
+			/*
+			 * the command order from user space needs to be
+			 * maintained use ordered workqueue to prevent
+			 * concurrency
+			 */
 			led->workqueue = alloc_ordered_workqueue
 							("led_workqueue", 0);
 			if (!led->workqueue) {
@@ -3061,7 +4797,7 @@ static int qpnp_leds_probe(struct spmi_device *spmi)
 					goto fail_id_check;
 			}
 			if (led->mpp_cfg->pwm_cfg->use_blink) {
-				
+				/*use_blink is for qcom lut breath blink, not for htc blink*/
 				rc = sysfs_create_group(&led->cdev.dev->kobj,
 					&blink_attr_group);
 				if (rc)
@@ -3109,8 +4845,12 @@ static int qpnp_leds_probe(struct spmi_device *spmi)
 			if (rc < 0) {
 				LED_ERR("%s: Failed to create %s attr ModeRGB\n", __func__,  led->cdev.name);
 			}
+			rc = device_create_file(led->cdev.dev, &dev_attr_mode_and_lut_params);
+			if (rc < 0) {
+				LED_ERR("%s: Failed to create %s attr mode_and_lut_params\n", __func__,  led->cdev.name);
+			}
 		}else{
-			
+			/* configure default state */
 			if (led->default_on) {
 				led->cdev.brightness = led->cdev.max_brightness;
 				__qpnp_led_work(led, led->cdev.brightness);
@@ -3129,8 +4869,8 @@ static int qpnp_leds_probe(struct spmi_device *spmi)
 					if (rc < 0) {
 						LED_ERR("%s: Failed to create %s attr off_timer\n", __func__,  led->cdev.name);
 					}
-					
-					INIT_WORK(&led->led_off_work, led_off_work_func); 
+					/*alarm_init(&led->led_alarm, ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP, led_alarm_handler);*/
+					INIT_WORK(&led->led_off_work, led_off_work_func); /*Off blink after alarm*/
 				}
 				INIT_DELAYED_WORK(&led->blink_delayed_work, led_blink_do_work);
 			}
@@ -3143,6 +4883,33 @@ static int qpnp_leds_probe(struct spmi_device *spmi)
 				rc = device_create_file(led->cdev.dev, &dev_attr_blink);
 				rc = device_create_file(led->cdev.dev, &dev_attr_pwm_coefficient);
 				rc = device_create_file(led->cdev.dev, &dev_attr_current_set);
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_speed);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_number);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_number_max);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_speed_max);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_rgb_pulse);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_rgb_blink_light_level);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_light_level);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_rgb_batt_colored);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_rgb_batt_test);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_flash_blink);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_flash_blink_number);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_flash_blink_bright);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_flash_blink_bright_number);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_flash_blink_wait_sec);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_flash_blink_wait_inc);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_flash_blink_wait_inc_max);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_flash_haptic_mode);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_flash_dim_mode);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_flash_dim_use_period);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_flash_dim_period_start_hour);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_flash_dim_period_end_hour);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_vib_notification);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_vib_notification_slowness);
+				rc = device_create_file(led->cdev.dev, &dev_attr_bln_vib_notification_length);
+#endif
 				rc = device_create_file(led->cdev.dev, &dev_attr_set_color_ID);
 				if (rc < 0) {
 					LED_ERR("%s: Failed to create %s attr blink\n", __func__,  led->cdev.name);
@@ -3152,10 +4919,20 @@ static int qpnp_leds_probe(struct spmi_device *spmi)
 					if (rc < 0) {
 						LED_ERR("%s: Failed to create %s attr off_timer\n", __func__,  led->cdev.name);
 					}
-					
-					INIT_WORK(&led->led_off_work, led_off_work_func); 
+					/*alarm_init(&led->led_alarm, ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP, led_alarm_handler);*/
+					INIT_WORK(&led->led_off_work, led_off_work_func); /*Off blink after alarm*/
 				}
 				INIT_DELAYED_WORK(&led->blink_delayed_work, led_blink_do_work);
+
+#ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+				alarm_init(&blinkstopfunc_rtc, ALARM_REALTIME,
+					blinkstop_rtc_callback);
+				alarm_init(&vibrate_rtc, ALARM_REALTIME,
+					vibrate_rtc_callback);
+				alarm_init(&double_double_vol_rtc, ALARM_REALTIME,
+					double_double_vol_rtc_callback);
+				uci_add_sys_listener(uci_sys_listener);
+#endif
 			}
 		}
 
