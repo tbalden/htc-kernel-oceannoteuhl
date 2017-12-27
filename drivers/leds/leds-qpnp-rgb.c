@@ -4505,6 +4505,46 @@ static int fb_notifier_callback(struct notifier_block *self,
     LED_DBG("%s\n", __func__);
 
 #ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
+
+	if (evdata && evdata->data && event == FB_EVENT_AOD_MODE && g_led_virtual) {
+		int aod_mode = *(int *)evdata->data;
+		if (aod_mode == FB_AOD_IDLE || aod_mode == FB_AOD_PARTIAL_ON) {
+			LED_ERR("%s off intent... \n", __func__);
+			if (screen_on) {
+				// screen off
+				screen_on = 0;
+				screen_on_early = 0;
+				LED_ERR("%s off\n", __func__);
+				if (haptic_blinking) {
+					qpnp_buttonled_blink(1);
+				} 
+			}
+		} else {
+			LED_ERR("%s on intent... \n", __func__);
+			if (!screen_on) {
+				// screen on
+				wake_by_user = 0;
+				pr_info("%s fb wake_by_user %d diff %u\n",__func__, wake_by_user, last_vk_wake_diff);
+				screen_on_early = 1;
+				if (blinking) {
+					qpnp_buttonled_blink(0);
+				}
+				screen_on = 1;
+				// check if first wake or other user input directly before this notifier callback, like doubletap wake...
+				wake_by_user = first_wake || last_input_event_diff < 140; // || !aosp_mode;
+				first_wake = 0; // boot up wake over...
+				pr_info("%s self wake: wake event FULL: wake by user result %d diff %u \n",__func__, wake_by_user, last_input_event_diff);
+				LED_ERR("%s real on\n", __func__);
+				if (wake_by_user) {
+					flash_stop_blink();
+					alarm_cancel(&blinkstopfunc_rtc);
+					// user is inputing/waking phone, no haptic blinking should trigger BLN when screen off
+					haptic_blinking = 0;
+				}
+			}
+		}
+	}
+
     if (evdata && evdata->data && event == FB_EARLY_EVENT_BLANK && g_led_virtual) {
         blank = evdata->data;
         switch (*blank) {
@@ -4513,12 +4553,6 @@ static int fb_notifier_callback(struct notifier_block *self,
 		// if last virtualkey wake was very close, it means that it the user powered screen on.
 		// if it's ambient display, virtual key lights are not set very close to the fb blank events...
 		///// ...also do not care about this if it's not aosp mode
-		wake_by_user = 0;
-		pr_info("%s fb wake_by_user %d diff %u\n",__func__, wake_by_user, last_vk_wake_diff);
-		screen_on_early = 1;
-		if (blinking) {
-			qpnp_buttonled_blink(0);
-		}
 		break;
 	}
     }
@@ -4529,18 +4563,6 @@ static int fb_notifier_callback(struct notifier_block *self,
         switch (*blank) {
         case FB_BLANK_UNBLANK:
 #ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
-		screen_on = 1;
-		// check if first wake or other user input directly before this notifier callback, like doubletap wake...
-		wake_by_user = first_wake || last_input_event_diff < 140; // || !aosp_mode;
-		first_wake = 0; // boot up wake over...
-		pr_info("%s self wake: wake event FULL: wake by user result %d diff %u \n",__func__, wake_by_user, last_input_event_diff);
-		LED_ERR("%s on\n", __func__);
-		if (wake_by_user) {
-			flash_stop_blink();
-			alarm_cancel(&blinkstopfunc_rtc);
-			// user is inputing/waking phone, no haptic blinking should trigger BLN when screen off
-			haptic_blinking = 0;
-		}
 #endif
             break;
 
@@ -4550,13 +4572,16 @@ static int fb_notifier_callback(struct notifier_block *self,
         case FB_BLANK_NORMAL:
             
 #ifdef CONFIG_LEDS_QPNP_BUTTON_BLINK
-		screen_on = 0;
-		screen_on_early = 0;
-		LED_ERR("%s off\n", __func__);
-	    if (haptic_blinking) {
-		qpnp_buttonled_blink(1);
-	    } 
-	    else
+		if (screen_on) {
+			// screen off
+			screen_on = 0;
+			screen_on_early = 0;
+			LED_ERR("%s blank event off\n", __func__);
+			if (haptic_blinking) {
+				qpnp_buttonled_blink(1);
+			} 
+		}
+	    if (!blinking)
 #endif
             if(g_led_virtual->cdev.brightness) {
 				g_led_virtual->cdev.brightness = 0;
