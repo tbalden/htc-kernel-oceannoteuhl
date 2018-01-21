@@ -50,9 +50,7 @@ extern struct vib_trigger *vib_trigger;
 static int vib_strength = VIB_STRENGTH;
 static int unlock_vib_strength = VIB_STRENGTH;
 
-static unsigned long last_screen_event_timestamp = 0;
 static unsigned int last_screen_off_seconds = 0;
-static unsigned int last_screen_on_seconds = 0;
 
 unsigned int get_global_seconds(void) {
 	struct timespec ts;
@@ -75,10 +73,6 @@ static int get_unlock_vib_strength(void) {
 #ifdef CONFIG_FB
 	// early screen on flag
 	static int screen_on = 1;
-	static unsigned long last_screen_on_early_time = 0;
-	// full screen on flag
-	static int screen_on_full = 1;
-	static int screen_off_early = 0;
 	struct notifier_block *fb_notifier;
 
 int input_is_screen_on(void) {
@@ -1217,57 +1211,27 @@ static int fb_notifier_callback(struct notifier_block *self,
                                  unsigned long event, void *data)
 {
     struct fb_event *evdata = data;
-    int *blank;
 
-    // catch early events as well, as this helps a lot correct functioning knowing when screen is almost off/on, preventing many problems 
-    // interpreting still screen ON while it's almost off and vica versa
-    if (evdata && evdata->data && event == FB_EARLY_EVENT_BLANK && fpf_pwrdev) {
-        blank = evdata->data;
-        switch (*blank) {
-        case FB_BLANK_UNBLANK:
-		screen_on = 1;
-		screen_off_early = 0;
-		last_screen_on_seconds = get_global_seconds();
-		last_screen_on_early_time = jiffies;
-		pr_info("fpf kad screen on -early\n");
-            break;
-
-        case FB_BLANK_POWERDOWN:
-        case FB_BLANK_HSYNC_SUSPEND:
-        case FB_BLANK_VSYNC_SUSPEND:
-        case FB_BLANK_NORMAL:
-		screen_on = 0;
-		screen_off_early = 1;
-		//screen_on_full = 0;
-		pr_info("fpf kad screen off -early\n");
-            break;
-        }
-    }
-    if (evdata && evdata->data && event == FB_EVENT_BLANK && fpf_pwrdev) {
-        blank = evdata->data;
-        switch (*blank) {
-        case FB_BLANK_UNBLANK:
-		{
-		screen_on = 1;
-		screen_on_full = 1;
-		last_screen_event_timestamp = jiffies;
-		pr_info("fpf screen on\n");
+	if (evdata && evdata->data && event == FB_EVENT_AOD_MODE) {
+		int aod_mode = *(int *)evdata->data;
+		if (aod_mode == FB_AOD_IDLE || aod_mode == FB_AOD_PARTIAL_ON) {
+			pr_info("%s fpf off intent... \n", __func__);
+			if (screen_on) {
+				// screen off
+				screen_on = 0;
+				last_screen_off_seconds = get_global_seconds();
+				last_screen_lock_check_was_false = 0;
+				pr_info("fpf kad screen off\n");
+			}
+		} else {
+			pr_info("%s fpf on intent... \n", __func__);
+			if (!screen_on) {
+				// screen on
+				screen_on = 1;
+			}
 		}
-            break;
+	}
 
-        case FB_BLANK_POWERDOWN:
-        case FB_BLANK_HSYNC_SUSPEND:
-        case FB_BLANK_VSYNC_SUSPEND:
-        case FB_BLANK_NORMAL:
-		screen_on = 0;
-		screen_on_full = 0;
-		last_screen_event_timestamp = jiffies;
-		last_screen_off_seconds = get_global_seconds();
-		last_screen_lock_check_was_false = 0;
-		pr_info("fpf kad screen off\n");
-            break;
-        }
-    }
     return 0;
 }
 #endif
