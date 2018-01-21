@@ -84,7 +84,9 @@
 static struct fb_info *fbi_list[MAX_FBI_LIST];
 static int fbi_list_index;
 
-#if 1 // TODO
+#define CONFIG_BACKLIGHT_DIMMER
+
+#ifdef CONFIG_BACKLIGHT_DIMMER
 #define MDSS_BRIGHT_TO_BL_DIM(out, v) do {\
 			out = (v*v+46000*v-3000000)/50000;\
 			} while (0)
@@ -374,7 +376,7 @@ static void mdss_fb_set_bl_brightness(struct led_classdev *led_cdev,
 	}
 }
 
-#if 1
+#ifdef CONFIG_BACKLIGHT_DIMMER
 static ssize_t backlight_min_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
@@ -442,7 +444,7 @@ static void mdss_fb_set_bl_brightness_hybrid(struct led_classdev *led_cdev,
 	if (!sub_only) {
 		bl_lvl = mdss_backlight_trans(value, &mfd->panel_info->brt_bl_table[0], true);
 
-#if 1
+#ifdef CONFIG_BACKLIGHT_DIMMER
 		last_brightness = value;
 		first_brightness_set = true;
 #ifdef CONFIG_UCI
@@ -450,9 +452,10 @@ static void mdss_fb_set_bl_brightness_hybrid(struct led_classdev *led_cdev,
 #else
 		if (backlight_dimmer)
 #endif
+		{
 			MDSS_BRIGHT_TO_BL_DIM(bl_lvl, bl_lvl);
-
-		bl_lvl = MAX(backlight_min, bl_lvl);
+			bl_lvl = MAX(backlight_min, bl_lvl);
+		}
 #endif
 		
 		if (htc_is_burst_bl_on(mfd, value)) {
@@ -471,15 +474,16 @@ static void mdss_fb_set_bl_brightness_hybrid(struct led_classdev *led_cdev,
 
 		if (mfd->bl_sync) {
 			sub_bl_lvl = mdss_backlight_trans(value, &mfd->panel_info->brt_bl_table[1], true);
-#if 1
+#ifdef CONFIG_BACKLIGHT_DIMMER
 #ifdef CONFIG_UCI
 			if (backlight_dimmer||backlight_dimmer_uci)
 #else
 			if (backlight_dimmer)
 #endif
+			{
 				MDSS_BRIGHT_TO_BL_DIM(sub_bl_lvl, sub_bl_lvl);
-
-			sub_bl_lvl = MAX(backlight_min, sub_bl_lvl);
+				sub_bl_lvl = MAX(backlight_min, sub_bl_lvl);
+			}
 #endif
 			if (sub_bl_lvl < 0)
 				sub_bl_lvl = 0;
@@ -490,18 +494,7 @@ static void mdss_fb_set_bl_brightness_hybrid(struct led_classdev *led_cdev,
 		mfd->last_bri1 = value;  
 	} else {
 		sub_bl_lvl = mdss_backlight_trans(value, &mfd->panel_info->brt_bl_table[1], true);
-#if 1
-		last_brightness = value;
-		first_brightness_set = true;
-#ifdef CONFIG_UCI
-		if (backlight_dimmer||backlight_dimmer_uci)
-#else
-		if (backlight_dimmer)
-#endif
-			MDSS_BRIGHT_TO_BL_DIM(sub_bl_lvl, sub_bl_lvl);
 
-		sub_bl_lvl = MAX(backlight_min, sub_bl_lvl);
-#endif
 		if (sub_bl_lvl < 0)
 			sub_bl_lvl = 0;
 	}
@@ -537,6 +530,7 @@ static struct led_classdev sub_backlight_led = {
 	.max_brightness = MDSS_MAX_BL_BRIGHTNESS,
 };
 
+#ifdef CONFIG_BACKLIGHT_DIMMER
 #ifdef CONFIG_UCI
 extern int input_is_screen_on(void);
 
@@ -555,10 +549,11 @@ static void uci_user_listener(void) {
 
 	if (first_brightness_set && change) {
 		if (last_brightness!=LED_OFF && input_is_screen_on()) {
-			mdss_fb_set_bl_brightness_hybrid(&backlight_hybrid, last_brightness);
+			//mdss_fb_set_bl_brightness_hybrid(&backlight_hybrid, last_brightness);
 		}
 	}
 }
+#endif
 #endif
 static ssize_t mdss_fb_get_type(struct device *dev,
 				struct device_attribute *attr, char *buf)
@@ -1495,8 +1490,10 @@ static int mdss_fb_probe(struct platform_device *pdev)
 
 	INIT_DELAYED_WORK(&mfd->idle_notify_work, __mdss_fb_idle_notify_work);
 
+#ifdef CONFIG_BACKLIGHT_DIMMER
 #ifdef CONFIG_UCI
 	uci_add_user_listener(uci_user_listener);
+#endif
 #endif
 
 	return rc;
@@ -5030,7 +5027,7 @@ int __init mdss_fb_init(void)
 	if (platform_driver_register(&mdss_fb_driver))
 		return rc;
 
-#if 1
+#ifdef CONFIG_BACKLIGHT_DIMMER
 	backlight_dimmer_kobj = kobject_create_and_add("backlight_dimmer", NULL);
 	if (backlight_dimmer_kobj == NULL) {
 		pr_warn("%s kobject create failed!\n", __func__);
